@@ -1,0 +1,1129 @@
+#block1: generate synthetic dataset.
+
+# the text file for the produced dataset is stored locally
+# the meaning of the file name 'syndata_f5v5_6zeros_1percen.txt':
+# f5: 5 features, v5: each feature has 5 values, 6zeros: values of outliers are up to 6000000, 
+# 1percet: the percentage of outerliers in the dataset
+filename = './syndata_set/syndata_f5v5_6zeros_1percen.txt'
+
+# three main parameters: rows: number of data instance, cols: number of features
+# featureValues: number of feature values for each feature 
+rows = 2000000 
+cols = 5
+featureValues=5
+
+# call class SyntheticDataGenerator to generate synthetic data 
+data = SyntheticDataGenerator(rows, cols,featureValues+1) 
+data.writeData(filename)
+
+print 'done'
+
+---------------------------
+
+#block2: load synthetic data and reset feature-value for categorical features for the next training and testing
+
+dta_RDD = sc.textFile("file:///home/tguo/tian_src/syndata_set/syndata_f5v5_6zeros_1percen.txt")
+dta_RDD.cache()
+# number of features in the dataset
+num_cols= 5
+
+
+# function called by RDD.map to organize data instance in the form of
+#  ( dependent variable, feature1, feature2, ....)
+def cons_valueFeatures( line):
+    val_feature=[float(line[num_cols]) ]
+    for i in range(0, num_cols):
+        val_feature.append(  int(line[i]))
+    return tuple(val_feature)
+    
+dta_splited = dta_RDD.map(lambda line: line.split(",")).map(lambda r: cons_valueFeatures(r)) 
+dta= dta_splited
+dta.cache()
+
+print 'tuple (dependent variable, features) :',dta.take(1)
+print dta.count()
+
+
+# re-set the index of categorical feature values for efficient best-split finding
+# for a categorical feature with n different values, its feature value should be
+# from 0 to n-1. (the decision tree in MLlib makes this assumption on dataset as well )
+
+# collect the raw different values of each feature
+feature_dist=[]
+for i in range(0, num_cols):
+    tmp1 = dta.map(lambda line: line[i+1]).distinct().collect()
+    feature_dist.append(tmp1)
+
+# build a map to map raw feature values to a consecutive range    
+fea_cnt= num_cols
+fea_map=[]
+for i in range(0, fea_cnt):
+    tmpcnt = len(feature_dist[i])
+    val_map= dict( zip(feature_dist[i], range(0,tmpcnt)) )
+    fea_map.append(val_map)
+    
+# reset the feature values
+def reset_index( line ):
+    tmp=[ line[0] ]
+    for i in range(0, num_cols):
+        tmp.append( fea_map[i][ line[i+1] ] )
+    return tuple(tmp)
+dta = dta.map( lambda line: reset_index(line)  )
+
+print 'feature value re-indexed:',dta.first()
+print dta.count()
+
+# check the number of different feature values for reset values.
+print 'check:'
+for i in range(0, num_cols):
+    tmp1 = dta.map(lambda line: line[i+1]).distinct().collect()
+    print len(tmp1)
+-----------------------------
+
+#block3: load data from HDFS, e.g., load BT data
+dta_RDD = sc.textFile("hdfs://computer61.ant-net/user/tguo/udpjitter-H1april2014_regTree_mllib.csv")
+
+# data type conversion and organize data of the form (dependent variable value, feature-values) 
+dta_splited = dta_RDD.map(lambda line: line.split(",")).map(lambda r:
+                                                                (float(r[0]),int( float(r[1])), 
+                                                                 int(float(r[2])),int(float(r[3])),
+                                                                 int(float(r[4])),int(float(r[5])),
+                                                                 int(float(r[6])),int(float(r[7])) ))
+
+dta= dta_splited
+dta.cache()
+print dta.first()
+print dta.count()
+----------------------------
+
+#block4: cluster side operations
+# build histograms for each feature-value in each tree node of the current layer
+
+# locate the node of the regression tree to which a data instance belongs to
+# input: 
+#   features: feature values of a data instance, <list>
+#   tree: is the tree structure we have trained so far, <list>
+# output: 
+#   tree node id of this data instance, <integer>
+def search_nodeToData(features, tree):
+    
+    nodeNum=len(tree)   
+    if nodeNum == 0:
+        return 0
+    
+    current_nodeIdx=0
+    while current_nodeIdx< nodeNum:
+        
+#       extract the split feature and feature-value set of the current tree node
+        split_feature= tree[current_nodeIdx][0]
+        split_valueSet= tree[current_nodeIdx][1]
+        
+#       if this tree node is not splitted, randomly continue the search path
+        if split_feature==-1:
+            current_nodeIdx=current_nodeIdx*2+1+ random.randint(0, 1)
+            continue
+#       if the feature values of this data instance is on the feature-value set of the left child
+        if (( 1<<features[split_feature]) &  split_valueSet) != 0 :
+            current_nodeIdx=current_nodeIdx*2+1
+        else:
+            current_nodeIdx=current_nodeIdx*2+2
+            
+#   return the 
+    return current_nodeIdx - nodeNum
+
+# binary search to find the bin of the histogram which a dependent value should be insert
+# input: 
+#   hist_list: histogram w.r.t a feature value, <list>
+#              the bins in histogram hist_list is maintained in the increasing order
+#   newY: the dependent variable value of a data instance to update the histogram,<float>
+# output: 
+#   the bin id in the histogram to update, <integer> 
+def update_hist_list_lookup( hist_list, newY ):
+    
+    cnt= len(hist_list)
+    l=0
+    r= len(hist_list)-1
+    
+    while l<r-1:
+        mid= l+ (r-l)/2
+        
+        if hist_list[mid][0]> newY:
+            r=mid
+        elif newY > hist_list[mid][1]:
+            l=mid
+        elif  hist_list[mid][0]  <= newY and newY<= hist_list[mid][1]:
+            return [1,mid]
+    
+    if hist_list[l][0]  <= newY and newY<= hist_list[l][1]:
+            return [1,l]
+    
+    if l+1<cnt and hist_list[l+1][0]  <= newY and newY<= hist_list[l+1][1]:
+            return [1,l+1]
+
+    if newY < hist_list[l][0]:
+        return [0,l]
+    
+    if l+1<cnt and newY< hist_list[ l+1 ][0]:
+        return [0,l+1]
+    elif l+1<cnt and newY> hist_list[ l+1 ][1]:
+        return [0,l+2]
+    
+    return [0,l+1]
+
+# update the histogram w.r.t. a feature value in a tree node with a data instance 
+# newY: dependent variable value
+# it calls function update_hist_list_lookup( hist_list, newY ) first to find the tree node
+
+# a histogram is maintained to ensure the number of bins is no more than the fixed value bin_num(in the block below)
+# a bin in the histogram is constructed by a list [] with three elements:
+#   value at index 0: left boundary of the bin
+#   value at index 1: right boundary of the bin
+#   value at index 2: number of data instatnces in the bin
+
+# input:
+#   hist_list: a list of bins in a histogram, <list>
+#   newY: the new independent variable value to insert, <float>
+# output:
+#   no direct output, update the histogram in input
+def update_hist_list( hist_list, newY ):
+    
+    cnt= len(hist_list)
+    
+#   condition: 
+#     cnt==0: if histogrm has no bins, just insert the new value
+    if cnt==0:        
+        hist_list.append([newY, newY,1])
+    else:
+#       call function update_hist_list_lookup() to find the position to insert newY 
+        pos=update_hist_list_lookup( hist_list, newY )
+        tmpidx=pos[1]
+        
+#       condition:
+#         pos[0]==1: if newY can be inserted to an existing bin
+#         otherwise: initialize a new bin for newY in the histogram
+        if pos[0]==1:
+            hist_list[tmpidx][2]= hist_list[tmpidx][2]+1
+        else:
+#           initialize a new bin for newY
+            hist_list.insert(tmpidx, [ newY,newY,1])
+            
+#   initizlize some variables used for bin elimination
+    tmpdis=-1
+#   indexes of two bins that could be merged
+    merge_l=0
+    merge_r=0
+    cnt=len(hist_list)
+#   initialize the minimum distance for finding the cloest bin
+    minDis =  hist_list[cnt-1][1] - hist_list[0][0]
+    
+#   if current number of bins exceeds the bin number bound, 
+#   scan the bins to find the pair of bin wih minimum distance and merge them
+    if cnt> bin_num:
+        
+        for i in range(0,cnt-1):
+            tmpdis= hist_list[i+1][0]-hist_list[i][1]
+            if tmpdis<minDis:
+                merge_l=i
+                merge_r=i+1
+                minDis=tmpdis
+        
+        hist_list[merge_l][1]= max(hist_list[merge_l][1],  hist_list[merge_r][1])
+        hist_list[merge_l][2]= hist_list[merge_l][2] + hist_list[merge_r][2]
+        hist_list.pop(merge_r)
+
+#   this function is called by mapPartition to process a data partition
+#   it builds histgorams for each feature-value of a tree node using the data locating
+#   at this node
+#   input: data partition is a list of tuples, i.e. list_dvAndfeatures
+
+#  the data structure maintained for each tree node is a hierachical structure:
+#  node - feature - value - histogram
+
+# input: the list of tuples in a data partition, <list>
+# output: an iterator, <composite list and dictionary>
+def partition_combiner_hist(list_dvAndfeatures):
+    
+#   data structure for maintaing the hisgorams for the local data partition
+    nodes_dict={}
+    
+#   iterate the data instance in data partition list_dvAndfeatures 
+    for dvAndfeatures in list_dvAndfeatures:
+        
+#       Y is the dependent variable value of current data instance dvAndfeatures   
+        Y= dvAndfeatures[0]
+        
+#       find the tree node data instance dvAndfeatures belongs to, 
+#       variable node is the output node id
+        node= search_nodeToData(dvAndfeatures[1:numFeatures+1],currentNode_split_fromMaster.value)
+        
+        if node in nodes_dict:
+            
+            
+#           for each tree node, i.e.,nodes_dict[node], it has three atrributes:
+#           ['sumY']: sume of Y of the data in this node
+#           ['count']: count of data instances in this node
+#           ['hist_list']: the histogram over the data of this node
+#           such attributes are used for debuging and the potential functionality extension in the future
+
+            nodes_dict[node]['sumY'] = nodes_dict[node]['sumY']+Y 
+            nodes_dict[node]['count'] = nodes_dict[node]['count']+1     
+            update_hist_list( nodes_dict[node]['hist_list'], Y)
+
+#           iterate each feature-value of this data instacne to update the 
+#           corresponidng histograms in nodes_dict 
+            for i in range(0,numFeatures):    
+                feature_val= dvAndfeatures[i+1]
+                
+                if feature_val not in nodes_dict[node][i]:
+                    
+                    nodes_dict[node][i].update( { feature_val: {}   }  )
+                    nodes_dict[node][i][feature_val].update( {'count_inFeatureValue':1} )                
+                    nodes_dict[node][i][feature_val].update( {'hist_val_list': [] } )
+                    update_hist_list( nodes_dict[node][i][feature_val]['hist_val_list'], Y)
+                    
+                else:
+#           the associate data struture for each feature-value has two attributes:
+#           1. ['count_inFeatureValue']: recode the number of data instacne having feature_val in feature i
+#           2. ['hist_val_list']: is the histogram built on the data of this feature-value
+                    nodes_dict[node][i][feature_val]['count_inFeatureValue'] = \
+                    nodes_dict[node][i][feature_val]['count_inFeatureValue']+1 
+                    update_hist_list( nodes_dict[node][i][feature_val]['hist_val_list'], Y)
+        else:
+            nodes_dict.update( {node: {}})  
+            nodes_dict[node].update( { 'sumY': Y} )
+            nodes_dict[node].update( { 'count': 1} )
+            nodes_dict[node].update( { 'hist_list': []   } )  
+            update_hist_list( nodes_dict[node]['hist_list'], Y)
+    
+            for i in range(0,numFeatures):
+                feature_val= dvAndfeatures[i+1]
+                
+                nodes_dict[node].update( { i: {}} )    
+                nodes_dict[node][i].update( { feature_val: {}   }  )
+                nodes_dict[node][i][feature_val].update( {'count_inFeatureValue':1} )                
+                nodes_dict[node][i][feature_val].update( {'hist_val_list': [] } )
+                
+                update_hist_list( nodes_dict[node][i][feature_val]['hist_val_list'], Y)
+          
+    return zip(nodes_dict.keys(), nodes_dict.values())
+
+
+# merge two histograms from two data partitions but w.r.t. the same feature-value of a tree node 
+# this function performs in a way similar to merge_sort to ensure the order of merged bins
+# input:
+#   the bins of two histograms, <two dimensional list>
+# output:
+#   a merged histogram, <two dimensional list>
+def merge_hist_list(hist1, hist2):
+    
+#   variable storing the merged histogram
+    tmphist=[]
+#   two pointers of the list hist1 and hist2
+    p1=0
+    p2=0
+#   the number of bins in each histogram
+    c1=len(hist1)
+    c2=len(hist2)
+    cnt=0
+        
+#   initialize the merged histogram using the bin with less left boundary
+    if p1<c1 and p2<c2 and hist1[p1][0] < hist2[p2][0]:
+        tmphist.append( [0,0,0] )
+        tmphist[cnt][0]= hist1[p1][0]
+        tmphist[cnt][1]= hist1[p1][1]
+        tmphist[cnt][2]= hist1[p1][2]
+        p1=p1+1
+        cnt=cnt+1
+    elif p1<c1 and p2<c2 and hist1[p1][0] >= hist2[p2][0] :
+        tmphist.append( [0,0,0] )
+        tmphist[cnt][0]= hist2[p2][0]
+        tmphist[cnt][1]= hist2[p2][1]
+        tmphist[cnt][2]= hist2[p2][2]
+        p2=p2+1
+        cnt=cnt+1
+    
+#   alternatively iterate over hist1 and hist2 to merge bins into the merged histgoram tmphist
+    while p1<c1 and p2<c2:
+        
+        while p2<c2 and hist2[p2][1] <= tmphist[cnt-1][1]:
+            tmphist[cnt-1][2]= tmphist[cnt-1][2] + hist2[p2][2]
+            p2=p2+1
+
+        while p1<c1 and hist1[p1][1] <= tmphist[cnt-1][1]:
+            tmphist[cnt-1][2]= tmphist[cnt-1][2] + hist1[p1][2]
+            p1=p1+1
+        
+        if p1<c1 and p2<c2 and hist1[p1][0] < hist2[p2][0]:
+            tmphist.append( [0,0,0] )
+            tmphist[cnt][0]= hist1[p1][0]
+            tmphist[cnt][1]= hist1[p1][1]
+            tmphist[cnt][2]= hist1[p1][2]
+            p1=p1+1
+            cnt=cnt+1  
+                
+        elif p1<c1 and p2<c2 and hist1[p1][0] >= hist2[p2][0]:
+            tmphist.append( [0,0,0] )
+            tmphist[cnt][0]= hist2[p2][0]
+            tmphist[cnt][1]= hist2[p2][1]
+            tmphist[cnt][2]= hist2[p2][2]
+            p2=p2+1
+            cnt=cnt+1
+    
+    while p2<c2 and hist2[p2][1] <= tmphist[cnt-1][1]:
+            tmphist[cnt-1][2]= tmphist[cnt-1][2] + hist2[p2][2]
+            p2=p2+1
+    while p1<c1 and hist1[p1][1] <= tmphist[cnt-1][1]:
+            tmphist[cnt-1][2]= tmphist[cnt-1][2] + hist1[p1][2]
+            p1=p1+1
+    
+#   append the left bins in either histogram to the merged histogram
+    while p1<c1:
+        tmphist.append( [0,0,0] )
+        tmphist[cnt][0]= hist1[p1][0]
+        tmphist[cnt][1]= hist1[p1][1]
+        tmphist[cnt][2]= hist1[p1][2]
+        cnt=cnt+1
+        p1=p1+1
+    while p2<c2:
+        tmphist.append( [0,0,0] )
+        tmphist[cnt][0]= hist2[p2][0]
+        tmphist[cnt][1]= hist2[p2][1]
+        tmphist[cnt][2]= hist2[p2][2]
+        cnt=cnt+1
+        p2=p2+1
+
+# If merged histogram has the number of bins less than bin_num, directly return.
+# Otherwise, iterate over the bins to continusly find the pairs of bin with minimum distance and merge them
+# until the bin_num constraint is addressed. 
+    cnt= len(tmphist)
+    if cnt< bin_num:
+        return tmphist
+    
+    tmpdis=[]  
+    for i in range(0, cnt-1):
+        tmpdis.append( ( abs( tmphist[i+1][0]-tmphist[i][1]), i, i+1 ) )        
+    
+    heapq.heapify(tmpdis)
+    cnt_remove= cnt- bin_num
+    bin_remove=[]
+    
+    root_bin=range(0, cnt)
+
+    for i in range(0, cnt_remove):
+        
+        tmptuple= heapq.heappop(tmpdis)
+        
+        merge_l= tmptuple[1]
+        merge_r= tmptuple[2]
+
+#       here use union-find algorithm to speed up the bin merge and removal process
+        tmproot= merge_l 
+        while root_bin[ tmproot] != tmproot:
+            tmproot= root_bin[tmproot]
+        tmphist[tmproot][1]= max(tmphist[tmproot][1], tmphist[merge_r][1])
+        tmphist[tmproot][2]= tmphist[tmproot][2] + tmphist[merge_r][2]
+        root_bin[merge_r]= tmproot    
+        
+        bin_remove.append( merge_r )
+    
+#   remove the right-side bin in a pair of merged bins
+    bin_remove.sort()
+    tmpdiff=0
+    for i in bin_remove:
+        tmphist.pop(i-tmpdiff)
+        tmpdiff=tmpdiff+1
+    return tmphist         
+
+#  this function is called by reduceByKey to merge histograms from two data partitions w.r.t. the same tree node
+#  this function calls merge_hist_list() above to merge a certain pair of histograms
+
+#  input: 
+#    two node histogram structure collected by above function partition_combiner_hist(),i.e. its output,
+#    <composite list and dictionary>
+#  output:
+#    unified histograms for a tree node, <composite list and dictionary>
+def merge_parttion_combiner_hist(nodeToFeatureToValue_1,nodeToFeatureToValue_2 ):
+    
+#   merge the node attributes 
+    nodeToFeatureToValue_1['sumY']= nodeToFeatureToValue_1['sumY']+\
+    nodeToFeatureToValue_2['sumY']
+    nodeToFeatureToValue_1['count']= nodeToFeatureToValue_1['count']+\
+    nodeToFeatureToValue_2['count'] 
+    nodeToFeatureToValue_1['hist_list']=merge_hist_list(nodeToFeatureToValue_1['hist_list'],\
+                                                   nodeToFeatureToValue_2['hist_list'])
+
+#   iterate the features to merge relevant histograms
+    for i in range(0, numFeatures): #feature
+        for j in nodeToFeatureToValue_1[i].keys(): #feature value
+            
+            feature_val=j
+            
+            if feature_val in nodeToFeatureToValue_2[i].keys():                  
+                
+                nodeToFeatureToValue_1[i][j]['hist_val_list'] = \
+                merge_hist_list(nodeToFeatureToValue_1[i][j]['hist_val_list'], 
+                           nodeToFeatureToValue_2[i][j]['hist_val_list'])     
+                
+                nodeToFeatureToValue_1[i][j]['count_inFeatureValue']=nodeToFeatureToValue_1[i][j]['count_inFeatureValue']+\
+                nodeToFeatureToValue_2[i][j]['count_inFeatureValue']
+                
+    for i in range(0, numFeatures):
+        for j in nodeToFeatureToValue_2[i].keys():
+
+            feature_val=j
+            
+            if feature_val not in nodeToFeatureToValue_1[i].keys():
+                nodeToFeatureToValue_1[i].update({feature_val: {} })
+                nodeToFeatureToValue_1[i][feature_val]= copy.deepcopy(nodeToFeatureToValue_2[i][feature_val])
+                              
+    return  nodeToFeatureToValue_1
+
+-------------------------
+
+#block5: split decision on the local side.
+
+# calculate the median and LAD for the data in a histogram
+# input:
+#   hist: a histogram, <list>
+#   cnt: number of data instances in this histogram, <integer>
+def LAD_hist_list(hist, cnt): 
+    
+    num_bins= len(hist)
+    
+    cntByBounds=0
+    curCnt=0 
+    
+    if cnt%2 ==0 :
+        midCnt= cnt/2.0+1
+    else:
+        midCnt= ceil(cnt/2.0)
+    
+    mid_bin_idx=0
+    flag=0
+    
+    meanAbsDevi=0
+    median=0
+    
+    cntSum_beforeMid=0
+    
+    for i in range(0, num_bins): 
+        
+        if flag==0:
+            tmp_curCnt=curCnt+ hist[i][2]
+            tmp_cntByBounds =cntByBounds - (hist[i][0]+hist[i][1])/2.0*hist[i][2]
+        
+            if tmp_curCnt >= midCnt:
+                flag=1       
+                mid_bin_idx= i
+                cntSum_beforeMid = curCnt
+            else:    
+                curCnt=tmp_curCnt
+                cntByBounds=tmp_cntByBounds
+        else:
+            curCnt= curCnt - hist[i][2]
+            cntByBounds= cntByBounds + ( hist[i][0] + hist[i][1])/2.0* hist[i][2]
+    
+    if cnt == 1:
+        return (hist[0][0],0)
+    elif cnt ==0:
+        return (0,0)
+    else:        
+        sample_inMedBin =  midCnt - cntSum_beforeMid     
+        
+        if hist[mid_bin_idx][2] ==1:
+            median = hist[mid_bin_idx][0]
+        elif hist[mid_bin_idx][2] ==2:
+            median= (hist[mid_bin_idx][0] + hist[mid_bin_idx][1])*1.0/2.0
+        else:
+            median= hist[mid_bin_idx][0]*1.0 + \
+        (1.0*hist[mid_bin_idx][1]-1.0*hist[mid_bin_idx][0])/(hist[mid_bin_idx][2]-1)*(sample_inMedBin-1)
+        
+        
+        if cnt%2 ==0 :
+            if sample_inMedBin == 1:
+                median = (hist[mid_bin_idx-1][1] + median)/2.0
+            else:
+                median_offset = hist[mid_bin_idx][0]*1.0 + \
+        (1.0*hist[mid_bin_idx][1]-1.0*hist[mid_bin_idx][0])/(hist[mid_bin_idx][2]-1)*(sample_inMedBin-2)
+                median = (median + median_offset)/2.0
+    
+        meanAbsDevi =  cntByBounds + curCnt*median 
+        
+        if hist[mid_bin_idx][2] ==1:
+            return (median, meanAbsDevi*1.0/cnt)
+        
+        sample_val= hist[ mid_bin_idx][0]*1.0
+        sample_interval=1.0*(hist[mid_bin_idx][1]-hist[mid_bin_idx][0])/(hist[mid_bin_idx][2]-1.0)
+        
+        for i in range(0, hist[mid_bin_idx][2]):
+            sample_val= sample_val + sample_interval*i
+            meanAbsDevi=meanAbsDevi+ abs( sample_val-median)
+        
+        return (median, meanAbsDevi*1.0/cnt)
+
+    
+# during split selection phase, call this function to merge the histograms belonging to the feature-values
+# on the left or right side of the split. 
+# the returned merged histogram by this function will be used for median/mean and loss function calculations.
+
+# input: 
+#   hist1: a list of bins,<list>
+#   hist2: a list of bins,<list>
+# output:
+#   a merged hist, <list>
+def local_merge_hist_list(hist1, hist2):
+
+#   tmphist: stores the bins of merged histogram, <list>  
+    tmphist=[]
+    
+#   p1,p1: pointer for accessing the bins of hist1 and hist2,<integer>
+    p1=0
+    p2=0
+    
+#   c1, c2: number of bins in each histogram, <integer>   
+    c1=len(hist1)
+    c2=len(hist2)
+#   cnt: number of bins in the merged histogram, <integer>
+    cnt=0
+ 
+    last_choose=0
+    
+#   merging processing applies the idea of merge-sort and run in linear time
+#   recall that each bin in a histogram is represented by a list of three element 
+#   [left boundary, right boundary, number of data instances ]
+
+#   insert the bin with left-most boundary from his1 and hist2 into the tmphist[] initially
+    if p1<c1 and p2<c2 and hist1[p1][0] < hist2[p2][0]:
+        tmphist.append( [0,0,0] )
+        tmphist[cnt][0]= hist1[p1][0]
+        tmphist[cnt][1]= hist1[p1][1]
+        tmphist[cnt][2]= hist1[p1][2]
+        p1=p1+1
+        cnt=cnt+1
+        last_choose=1
+    elif p1<c1 and p2<c2 and hist1[p1][0] >= hist2[p2][0] :
+        tmphist.append( [0,0,0] )
+        tmphist[cnt][0]= hist2[p2][0]
+        tmphist[cnt][1]= hist2[p2][1]
+        tmphist[cnt][2]= hist2[p2][2]
+        p2=p2+1
+        cnt=cnt+1
+        last_choose=2
+    
+#   merge-sort process  
+    while p1<c1 and p2<c2:
+        
+#       if a bin in hist1 (or hist2) is included in the last bin of the merged histogram, 
+#       this bin is directd integrated into that bin of the merged histogram
+        while p2<c2 and hist2[p2][1] <= tmphist[cnt-1][1]:
+            tmphist[cnt-1][2]= tmphist[cnt-1][2] + hist2[p2][2]
+            p2=p2+1
+        while p1<c1 and hist1[p1][1] <= tmphist[cnt-1][1]:
+            tmphist[cnt-1][2]= tmphist[cnt-1][2] + hist1[p1][2]
+            p1=p1+1
+        
+#       choose a bin from hist1 or hist2 to append as a new bin into the merged histogram
+        if p1<c1 and p2<c2 and hist1[p1][0] < hist2[p2][0]:
+            tmphist.append( [0,0,0] )
+            tmphist[cnt][0]= hist1[p1][0]
+            tmphist[cnt][1]= hist1[p1][1]
+            tmphist[cnt][2]= hist1[p1][2]
+            p1=p1+1
+            cnt=cnt+1  
+            last_choose =1
+        elif p1<c1 and p2<c2 and hist1[p1][0] >= hist2[p2][0]:
+            tmphist.append( [0,0,0] )
+            tmphist[cnt][0]= hist2[p2][0]
+            tmphist[cnt][1]= hist2[p2][1]
+            tmphist[cnt][2]= hist2[p2][2]
+            p2=p2+1
+            cnt=cnt+1
+            last_choose =2
+
+#       if a bin in hist1 (or hist2) is included in the last bin of the merged histogram, 
+#       this bin is directd integrated into that bin of the merged histogram
+    while p2<c2 and hist2[p2][1] <= tmphist[cnt-1][1]:
+        tmphist[cnt-1][2]= tmphist[cnt-1][2] + hist2[p2][2]
+        p2=p2+1
+    while p1<c1 and hist1[p1][1] <= tmphist[cnt-1][1]:
+        tmphist[cnt-1][2]= tmphist[cnt-1][2] + hist1[p1][2]
+        p1=p1+1
+    
+#   insert the left bins in hist1 and hist2 into the merged histogram
+    while p1<c1:
+        
+        tmphist.append( [0,0,0] )
+        tmphist[cnt][0]= hist1[p1][0]
+        tmphist[cnt][1]= hist1[p1][1]
+        tmphist[cnt][2]= hist1[p1][2]
+        cnt=cnt+1
+        p1=p1+1
+        
+    while p2<c2:
+        
+        tmphist.append( [0,0,0] )
+        tmphist[cnt][0]= hist2[p2][0]
+        tmphist[cnt][1]= hist2[p2][1]
+        tmphist[cnt][2]= hist2[p2][2]
+        cnt=cnt+1
+        p2=p2+1
+    
+    return tmphist
+
+# find the best split on a certain feature of a tree node
+# input:
+#   values_hist: the histograms corresponding to each value in this feature, <dictionary>
+#   node_data_cnt: the number of data instances in this tree node, i.e.,the number of data on this feature,<integer>
+#   node_hist: the histogram of this node
+# output: 
+#   the best split value on this feature and the featur-value set for the left split, < tuple>
+#   [ leftSplit_valueSet, mean/median estimate for the data in the left split, 
+#     mean/median estimate for the data in the right split, the value of the loss function on the best split ]
+def split_onOneFeature_hist( values_hist,node_data_cnt, node_hist):
+    
+#   initialize the number of data instances on the left split   
+    leftSplit_count = 0
+#   initialize the feature-value set for the left split  
+    leftSplit_valueSet = 0 
+
+#   initialize two empty historams that will be used to summarize the data on the left and right splits    
+    leftSplit_hist= []
+    rightSplit_hist=[]
+    
+#   two tuples for recording the median estiamte and loss function values on the left and right splits
+#   during the following split choosing process
+    bestLeft=(-1,-1)
+    bestRight=(-1,-1)
+    
+#   initialize the loss function value as zero 
+    bestSplitMetric =0 
+    
+# ------- sort feature values according to median ------------------ 
+    sorted_value_map=[]
+    
+#   for each feature-value, call loss function calculation function, i.e., LAD_hist_list(), 
+#   to compute the median for the data with this feature-value
+    for i in values_hist:
+        
+#        <integer> 
+        currentVal=i
+#       the number of data instances wit feature-value currentVal, <integer>
+        currentVal_hist_count= values_hist[i]['count_inFeatureValue']
+#       histogram of current feature-value, <list>
+        currentVal_hist= values_hist[i]['hist_val_list']
+    
+#       call function LAD_hist_list() to compute the median using the histogram of current feature-value
+#       and insert a tuple ( feature-value, median of data in this featurevalue ) into list sorted_value_map[]
+        sorted_value_map.append((currentVal,LAD_hist_list(currentVal_hist,currentVal_hist_count)))
+
+#   sort the list according to medians, <list>         
+    sorted_value_map=sorted(sorted_value_map, key= lambda val: val[1][0] )
+#   number of available values in this feature,<integer>
+    values_cnt= len(sorted_value_map)
+    
+    
+#   check the number of available feature values
+#   if it is less than 2, this feature cannot be further splited and return directly 
+    if values_cnt <= 1:
+        return [-1,-1,-1,-1]
+    
+#--------- initialize the featur-value-set on the left split with the first feature-value ------------------
+#   insert the first feature-value in sorted value list sorted_value_map[] 
+#   to the left split for initilization.
+# 
+#   record the median estimate and weighted loss under this initial split
+    
+    current_feature_value = sorted_value_map[0][0] 
+    currentVal_count= values_hist[current_feature_value]['count_inFeatureValue']
+    currentVal_hist= values_hist[current_feature_value]['hist_val_list']
+    
+    leftSplit_count = leftSplit_count+currentVal_count     
+    
+#   call function local_merge_hist_list() 
+#   to merge the histogram of current feature-value into the histogram of the left split 
+    leftSplit_hist=local_merge_hist_list( leftSplit_hist, currentVal_hist)
+    
+#   call function local_merge_hist_list() 
+#   to merge the histograms of left feature-values into the histogram of the right split 
+    rightSplit_hist={}
+    tmp_value=0
+    for j in range(0, values_cnt-1 ):
+        tmp_value = sorted_value_map[values_cnt-1-j][0]
+        rightSplit_hist= local_merge_hist_list( rightSplit_hist, values_hist[tmp_value]['hist_val_list'])      
+    
+#   call function LAD_hist_list to comupte the median and LAD of initial left and right split  
+    left = LAD_hist_list( leftSplit_hist, leftSplit_count)
+    right= LAD_hist_list( rightSplit_hist, (node_data_cnt - leftSplit_count))    
+    
+#   extract the median and LAD of each split     
+    leftMedian= left[0]
+    leftMetric= left[1]
+    rightMedian= right[0]
+    rightMetric= right[1]
+        
+#   compute the weighted loss: weight= number of data instances in a split/ total numbero of data instance       
+    current_splitMetric=1.0*leftSplit_count/node_data_cnt*leftMetric + \
+                               1.0*(node_data_cnt - leftSplit_count)/node_data_cnt*rightMetric
+        
+#   initiliaize the variables for recording the best split
+    bestSplitMetric=current_splitMetric     
+    bestLeft=left
+    bestRight=right
+    #bit variable to record which value is chosen for the left child
+    leftSplit_valueSet=leftSplit_valueSet+ (1<<current_feature_value)
+    
+
+#-------------begin to iterate over the sorted feature values to find the best split on this feature ------
+
+#   iterate over the remaining feature-values to find the best split on this feature
+    for k in range(1,values_cnt-1):
+        
+#       <integer>
+        current_feature_value = sorted_value_map[k][0]
+#       the number of data instances with current feature-value, <integer>
+        currentVal_count = values_hist[current_feature_value]['count_inFeatureValue']
+#       the histogram of current feature value, <list>
+        currentVal_hist = values_hist[current_feature_value]['hist_val_list']
+        
+#       histograms for the left values
+        leftSplit_count = leftSplit_count+currentVal_count     
+        leftSplit_hist=local_merge_hist_list( leftSplit_hist, currentVal_hist)
+    
+#       histograms for the right values
+        rightSplit_hist={}
+        tmp_value=0
+        for j in range(0, values_cnt-1-k ):
+            tmp_value = sorted_value_map[values_cnt-1-j][0]
+            rightSplit_hist= local_merge_hist_list( rightSplit_hist, values_hist[tmp_value]['hist_val_list'])      
+            
+        left = LAD_hist_list( leftSplit_hist, leftSplit_count)
+        right= LAD_hist_list( rightSplit_hist, (node_data_cnt - leftSplit_count)) 
+        
+#   extract the median and LAD of left and right splits           
+        leftMedian= left[0]
+        leftMetric= left[1]
+        rightMedian= right[0]
+        rightMetric= right[1]
+        
+#   compute the weighted loss: weight= number of data instances in a split/ total numbero of data instance                       
+        current_splitMetric=1.0*leftSplit_count/node_data_cnt*leftMetric + \
+                               1.0*(node_data_cnt - leftSplit_count)/node_data_cnt*rightMetric
+#   compare the current loss with the best loss sofar 
+        if current_splitMetric < bestSplitMetric:
+            
+#   if this is a better one, update the loss 
+            bestSplitMetric=current_splitMetric
+            bestLeft=left
+            bestRight=right
+            leftSplit_valueSet=leftSplit_valueSet+ (1<<current_feature_value)        
+    
+#   return the result of best split in the form of 
+# [ feature-value set in the left split, median estimation for the left split, median estimation for the right split,
+#   weighted loss value], <list>
+    return [leftSplit_valueSet, bestLeft[0], bestRight[0], bestSplitMetric ]
+
+
+
+
+# iterate over each tree node to find the best-split for each one
+# input:
+#   local_aggre_nodes: the histograms for each tree node collected from cluster-side, <composite structure of list
+#                      and dictionary>
+#   current_NumNodes: the number of tree nodes in the current layer,<integer>
+#   nodes_tree: record the split feature and feature-values of each tree node, it will be updated during the
+#               execution of this function, <list>
+#   node_tree_test: record the estimation value for each tree node, it will be updated during the
+#                   execution of this function, <list>
+# output:
+#   the best split and estimation on each tree node in the current layer are appended to 
+#   list variable nodes_tree and nodes_tree_test
+def find_bestSplit_hist(local_aggre_nodes, current_NumNodes, nodes_tree, \
+                        nodes_tree_test):
+    
+#   index to iterate over the local histograms of tree nodes in variable local_aggre_nodes 
+    local_node_idx=0
+#   the number of tree nodes already splitted and stored in node_tree
+    cur_node_num= len(nodes_tree)
+    
+#   iterate over the number of tree nodes in the current layer
+    for i in range(0, current_NumNodes):
+
+#------------- grow the unbalanced tree ---------------------------------- 
+#  first, it judges whether a tree node needs to be splitted
+#  the condition is:
+#    if a tree node's parent node stops growing, then this node just inherits the estimation value from its parent 
+#    node and does not need to split
+     
+#  above condition only needs to be checked for the nodes below tree depth 2
+        if cur_node_num >= 3:
+#           derive the parent_node index 
+            parent_node = int(math.ceil(  (i + cur_node_num -2.0)*1.0/ 2 ))
+#           get the median estimation in the parent node and the best split feature in the parent node if any 
+            parent_node_esti =nodes_tree_test[2* parent_node +1 ] 
+            tmp_split_feature= nodes_tree[parent_node][0]
+        
+#           if a tree node stops growing, i.e., it is not splitted.
+#           its best-split feature is set to -1 before
+#           therefore, here tmp_split_feature is checked to see whether it is splitted or not
+            if tmp_split_feature == -1:
+#               the parent tree node is not spliited, this node does not need to grow either
+                nodes_tree.append(  (-1,  -1  )  )
+                nodes_tree_test.append( parent_node_esti  )
+                nodes_tree_test.append( parent_node_esti )
+                continue
+            else:
+#               this node needs to find best-split, then find the histograms belonging to it in the local
+#               histogram variable local_aggre_nodes
+                while i!= local_aggre_nodes[local_node_idx][0]:
+                    local_node_idx=local_node_idx+1
+                    
+#-------------search for the best split for the current node-------------   
+        
+#       the number of data instances in this tree node
+        node_count= local_aggre_nodes[local_node_idx][1]['count']
+#       a global histogram over the data of this tree node
+        node_hist=  local_aggre_nodes[local_node_idx][1]['hist_list']           
+        
+#       call function LAD_hist_list() to compute the median and LAD for the whole data of this tree node
+#       this LAD is set as the initial loss value for the next best-split searching process
+#       recall that the output of LAD_hist_list() is a tuple [median estimation, LAD]
+        tmp_metric= LAD_hist_list( node_hist, node_count)
+        best_split_sofar= tmp_metric[1]
+        best_split=(-1,-1,-1,-1)
+        
+
+#       initial values for best split feature and feature-value set         
+        best_split_feature=-1
+        best_split_featureValueSet=-1
+
+#       iterater over each feature to search for the best-split
+        for j in range(0,numFeatures):
+                     
+#           extract the histograms corresponding to the current feature j 
+#           from local histograms of the current tree node,   
+            statisticToValues = local_aggre_nodes[local_node_idx][1][j]
+          
+#           call function split_onOneFeature_hist to find the best split on feature j
+#           the ouput variable split is a tuple including 
+#            [ leftSplit_valueSet, mean/median estimate for the data in the left split, 
+#     mean/median estimate for the data in the right split, the value of the loss function on the best split ]
+            split=split_onOneFeature_hist(statisticToValues,node_count, node_hist)
+            
+#           compare the split on feature j to the best split found so far
+#           condition: 
+#             split[0]!=-1: checks whether this tree node can be splitted on feature j
+#                           if it is not, skip the comparison, since the current tree node cannot be splitted 
+#                           on feature j
+            if  split[0]!=-1 and  split[3] < best_split_sofar:
+                best_split=split
+                best_split_sofar=split[3]
+                best_split_feature = j
+                best_split_featureValueSet= split[0]
+         
+        
+        local_node_idx=local_node_idx+1
+        
+#------------- grow the unbalanced tree ---------------------------------- 
+        if best_split_feature == -1:
+            nodes_tree.append(  (-1,  -1  )  )
+            nodes_tree_test.append( tmp_metric[0]  )
+            nodes_tree_test.append( tmp_metric[0] )
+            continue
+#-------------------------------------------------------------------------        
+
+#       append the found best-split for the tree node to the tree strucutre variable 
+        nodes_tree.append(  (best_split_feature,  best_split_featureValueSet  )      )
+        
+#       append the median esitmation on the left and right children of the tree node to 
+#       tree estimation variable 
+        nodes_tree_test.append(best_split[1])
+        nodes_tree_test.append(best_split[2])
+    
+#     if local_node_idx != len(local_aggre_nodes):
+#         print '!!!! debug !!!!: not all local nodes are processed ', local_node_idx,len(local_aggre_nodes)
+        
+        
+        
+        
+
+----------------------------------
+
+#block6: training and testing data preparation
+# sample from the original data RDD variable: dta
+
+# outlier threshold to filter outliers in the testing dataset
+outlier_threshold = 1000
+
+dta_train_all = dta.cache().sample(False, .3, 12345)
+dta_test_all = dta.cache().sample(False, .1, 43243)
+
+print dta_train_all.count(), dta_test_all.count()
+
+# training data set can be set to have outerliers or not
+dta_train = dta_train_all
+# .filter(lambda line: line[0]<outlier_threshold )
+
+# filter outliers for testing data
+dta_test = dta_test_all.filter(lambda line: line[0]< outlier_threshold )
+
+print 'number of training data instance:',dta_train.count()
+print 'number of testing data instance:',dta_test.count()
+
+
+-----------------------------------------
+
+
+#block7: main loop for training process
+
+#parameters set-up
+# max depth of regression tree to train
+maxdepth= 10
+# number of features in the dataset
+numFeatures= 7
+# limit on the number of bin
+bin_num=700
+
+# variables for the tree structure 
+node_split=[]
+node_test=[]
+
+# variables to record training performance information 
+run_time=[]
+tree_history_split=[]
+tree_history_esti=[]
+tree_history_leaf=[]
+tree_history_runtime=[]
+
+# initilize an empty regression tree on the cluster side
+currentNode_split_fromMaster = sc.broadcast([])
+
+# starting time counter for overall running time   
+start = time.time() 
+        
+for cur_depth in range(0,maxdepth):
+    
+#   time counter for the running time of training over one layer of tree nodes
+    start_cluster = time.time() 
+#   calculate the number of tree nodes that require to split on current layer cur_depth      
+    current_NumNodes= int( math.pow(2,  cur_depth)) 
+    
+#   training data RDD dta_train calls mapPartitions 
+#   then mapPartition calls function partition_combiner_hist in block4 to collect data summarization 
+#   for the tree nodes in the current layer
+#   output variable: RDD statis_partitions containing histograms on different data partitions 
+    statis_partitions = dta_train.mapPartitions( partition_combiner_hist )
+        
+#   RDD statis_partitions calls function reduceByKey 
+#   then reduceByKey calls function merge_parttion_combiner_hist in block4 to merge the histograms
+#   output variable: RDD aggre_nodes containing the unified histograms for each node in the current layer
+    aggre_nodes =statis_partitions.reduceByKey(lambda statis_partition_1, statis_partition_2: 
+                              merge_parttion_combiner_hist(statis_partition_1,statis_partition_2 ))
+        
+#   collect the histograms to local side, < composite structure of list and dictionary >      
+    local_aggre_nodes= aggre_nodes.collect()
+#     print len(local_aggre_nodes) , current_NumNodes
+
+#   end time counter
+    end_cluster = time.time()
+    
+    
+#   function find_bestSplit_hist in block5 to find best-split for each node in the current layer
+#   
+#   input variable: 
+#   local_aggre_nodes: the collected histograms for the tree nodes in the current layer
+#   current_NumNodes: the number of tree nodes to split in this layer
+#   
+#   the next two variables are used for storing the split results:
+#   node_split: records the split-feature and split-feature-value for each tree node. This variable is broadcasted
+#               to the cluster side for next-loop data summarization. 
+#   node_test: records the estimate of dependent varible on each tree node, which is used for prediction.
+
+    find_bestSplit_hist( sorted(local_aggre_nodes,key= lambda val:val[0]),current_NumNodes, node_split, node_test)
+    end_local= time.time()
+    
+    
+#   broadcast variable node_split to the cluster for next-loop training    
+    currentNode_split_fromMaster = sc.broadcast(node_split)
+    
+#   monitor the running time on both cluster and local sides 
+    print "running time on cluster and local sides at height", maxdepth,":",end_cluster-start_cluster, end_local-end_cluster
+    
+    end = time.time()
+    elapsed = end-start
+    run_time.append(elapsed)
+
+#   extract the estimations on leaf nodes from the regression tree trained so far.
+#   for the algorithm inspection and debugging
+    leaf_nodes = node_test[ len(node_test)-  (int)( math.pow(2,i)): len(node_test)  ]
+    
+#   record the  for the regression tree trained so far  
+    tree_history_split.append(copy.deepcopy(node_split) )
+    tree_history_esti.append( copy.deepcopy(node_test)  )
+    tree_history_leaf.append( copy.deepcopy(leaf_nodes)  )
+    tree_history_runtime.append( copy.deepcopy(run_time)  )
+    
+#   monitor the training performance
+    print "overall running time at tree height", i,":",  elapsed,  end_cluster-start
+    print "number of leaf nodes at tree height", i,":",  len(leaf_nodes)
+    
+
+
+----------------------------
+
+
+# block9: use testing dataset to test the regression tree in the layer-by-layer way 
+# you can see the testing error is decreasing as the training depth increases 
+# 
+# starting from using two children nodes of root node as leaf nodes of depth-1 tree to predict values
+
+
+#  this fuction is called by RDD.map() to perform value prediction and error computation
+#  it calls function search_nodeToData() above to locate the tree node the give testing instance belongs to
+#  input:
+#    line: input data instance, [value of Y, feature-values..],<tuple>
+#  output: 
+#    error square, <float>
+def test_error_mapFunc(line):
+    tmpnode = search_nodeToData(line[1:numFeatures+1], test_tree_split)    
+    return (test_leaf_nodes[ tmpnode ]  - line[0])*(test_leaf_nodes[ tmpnode ]  - line[0])
+
+# this function test the regression tree up to depth current_depth using the testing data RDD
+# input:
+#   current_depth: the depth of regression tree to test,<integer>
+#   testRDD: RDD containting test data, <RDD>
+# output:
+#   MSE of the testing data set, <float>
+def test_error_tree( current_depth, testRDD  ):
+
+    test_cnt= testRDD.count()
+    err_rdd=testRDD.map( lambda line: test_error_mapFunc(line))
+    err_sum = err_rdd.reduce( lambda a,b: a+b)
+    
+    print 'test error at depth',current_depth, ':', err_sum*1.0/test_cnt
+    return err_sum*1.0/test_cnt
+
+
+# variable for marking the position of tree nodes on a certain depth of the regression tree 
+pre=0
+# estimations on the tree nodes,<list>
+tree_esti = lad_tree_history_esti[0]
+# split feature and feature-values of tree nodes 
+tree_split =  lad_tree_history_split[ 0 ]
+# store error result at different depths
+err_depth=[]
+
+# iterate over the depth of regression tree
+for i in range(1,maxdepth+1):
+            
+    end_bound= pre+ (int)( math.pow(2,i))
+    
+#   extract the value estimate on the nodes of the current depth from variable tree_esti 
+    test_leaf_nodes = tree_esti[ pre: end_bound  ]
+    pre= end_bound        
+#   extract the split feature and feature-value-set for the tree of current depth from variable tree_split   
+    test_tree_split= tree_split[ 0:(int)( math.pow(2,i)-1)  ]
+    
+#   function test_error_tree( i, dta_test) is defined in block11
+#   calculate the test error using the regression tree of current depth
+    err_depth.append(test_error_tree( i, dta_test)  ) 
+    
